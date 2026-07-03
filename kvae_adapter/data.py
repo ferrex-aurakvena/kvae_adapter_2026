@@ -12,6 +12,8 @@ import numpy as np
 import torch
 import zarr
 
+from .io_utils import fadvise_dontneed
+
 
 DEFAULT_SCALING_FACTOR = 0.476986
 
@@ -165,19 +167,21 @@ class ZarrZipLRU:
                 arr = root[keys[0]]
         self._cache[path] = (store, arr)
         while len(self._cache) > self.max_items:
-            _, (old_store, _) = self._cache.popitem(last=False)
+            old_path, (old_store, _) = self._cache.popitem(last=False)
             try:
                 old_store.close()
             except Exception:
                 pass
+            fadvise_dontneed(old_path)
         return arr
 
     def close(self) -> None:
-        for store, _ in self._cache.values():
+        for path, (store, _) in self._cache.items():
             try:
                 store.close()
             except Exception:
                 pass
+            fadvise_dontneed(path)
         self._cache.clear()
 
 
@@ -265,6 +269,7 @@ class K5CropDataset(torch.utils.data.Dataset):
         if not isinstance(z, torch.Tensor):
             raise RuntimeError(f"Latent file did not contain a tensor: {sample.latent_path}")
         z = maybe_squeeze_batch(z).contiguous().float()
+        fadvise_dontneed(sample.latent_path)
         z = unscale_latents_if_needed(
             z,
             latent_space=self.latent_space,
@@ -283,15 +288,29 @@ class K5CropDataset(torch.utils.data.Dataset):
         if c != 16:
             raise RuntimeError(f"Expected 16 latent channels, got {c} from {sample.latent_path}")
 
+        t_lat = min(self.t_lat, total_t)
         crop_lat_h = min(self.crop_lat, total_h)
         crop_lat_w = min(self.crop_lat, total_w)
+        t0 = 0 if total_t == t_lat else random.randint(0, total_t - t_lat)
+        y0 = 0 if total_h == crop_lat_h else random.randint(0, total_h - crop_lat_h)
+        x0 = 0 if total_w == crop_lat_w else random.randint(0, total_w - crop_lat_w)
+        return self.get_fixed(idx, t0=t0, y0=y0, x0=x0)
+
+    def get_fixed(self, idx: int, *, t0: int, y0: int, x0: int) -> tuple[torch.Tensor, torch.Tensor, CropInfo]:
+        sample = self.samples[idx]
+        z = self._load_latent(sample)
+        if z.ndim != 4:
+            raise RuntimeError(f"Expected latent [C,T,H,W], got {tuple(z.shape)} from {sample.latent_path}")
+        c, total_t, total_h, total_w = z.shape
+        if c != 16:
+            raise RuntimeError(f"Expected 16 latent channels, got {c} from {sample.latent_path}")
+
         t_lat = min(self.t_lat, total_t)
-        max_t0 = max(0, total_t - t_lat)
-        max_y0 = max(0, total_h - crop_lat_h)
-        max_x0 = max(0, total_w - crop_lat_w)
-        t0 = 0 if max_t0 == 0 else random.randint(0, max_t0)
-        y0 = 0 if max_y0 == 0 else random.randint(0, max_y0)
-        x0 = 0 if max_x0 == 0 else random.randint(0, max_x0)
+        crop_lat_h = min(self.crop_lat, total_h)
+        crop_lat_w = min(self.crop_lat, total_w)
+        t0 = max(0, min(int(t0), total_t - t_lat))
+        y0 = max(0, min(int(y0), total_h - crop_lat_h))
+        x0 = max(0, min(int(x0), total_w - crop_lat_w))
 
         z_crop = z[:, t0 : t0 + t_lat, y0 : y0 + crop_lat_h, x0 : x0 + crop_lat_w].to(dtype=self.latent_dtype)
         arr = self.zarr_cache.get_array(sample.teacher_zarr_path)
