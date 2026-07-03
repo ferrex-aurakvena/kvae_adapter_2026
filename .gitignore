@@ -1,0 +1,14 @@
+# Local environments
+/.venv_kvae_adapter/
+
+# Local data/model assets
+/datasets
+/vae
+
+# Archived prior repo copy
+/_ignored/
+
+# Python/runtime noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
