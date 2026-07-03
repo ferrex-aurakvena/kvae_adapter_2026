@@ -1,7 +1,28 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
+
+FEATURE_MODE_COORDS = "coords"
+FEATURE_MODE_COORDS_PHASE_V1 = "coords_phase_v1"
+FEATURE_MODE_CHOICES = (FEATURE_MODE_COORDS, FEATURE_MODE_COORDS_PHASE_V1)
+FEATURE_MODE_COORD_CHANNELS = {
+    FEATURE_MODE_COORDS: 3,
+    FEATURE_MODE_COORDS_PHASE_V1: 10,
+}
+
+
+def resolve_feature_mode(value: str | None) -> str:
+    mode = FEATURE_MODE_COORDS if value is None else str(value)
+    if mode not in FEATURE_MODE_CHOICES:
+        raise ValueError(f"unknown feature mode {mode!r}; expected one of {FEATURE_MODE_CHOICES}")
+    return mode
+
+
+def feature_coord_channels(feature_mode: str | None) -> int:
+    return FEATURE_MODE_COORD_CHANNELS[resolve_feature_mode(feature_mode)]
 
 
 def make_coord_grid(
@@ -18,8 +39,10 @@ def make_coord_grid(
     total_w: int,
     device: torch.device,
     dtype: torch.dtype,
+    feature_mode: str = FEATURE_MODE_COORDS,
 ) -> torch.Tensor:
-    """Return normalized t/y/x coordinate channels shaped [B, 3, T, H, W]."""
+    """Return adapter conditioning channels shaped [B, C, T, H, W]."""
+    feature_mode = resolve_feature_mode(feature_mode)
     tt = torch.arange(t, device=device, dtype=dtype).view(1, 1, t, 1, 1)
     yy = torch.arange(h, device=device, dtype=dtype).view(1, 1, 1, h, 1)
     xx = torch.arange(w, device=device, dtype=dtype).view(1, 1, 1, 1, w)
@@ -40,7 +63,21 @@ def make_coord_grid(
         ],
         dim=1,
     )
-    return coords.mul_(2).sub_(1)
+    coords = coords.mul_(2).sub_(1)
+    if feature_mode == FEATURE_MODE_COORDS:
+        return coords
+
+    phase_idx = (
+        t0.to(device=device, dtype=torch.long).view(batch, 1, 1, 1, 1)
+        + torch.arange(t, device=device, dtype=torch.long).view(1, 1, t, 1, 1)
+    ).remainder(4)
+    phase_float = phase_idx.to(dtype=dtype)
+    phase_angle = phase_float * (2.0 * math.pi / 4.0)
+    sin_phase = phase_angle.sin().expand(batch, 1, t, h, w)
+    cos_phase = phase_angle.cos().expand(batch, 1, t, h, w)
+    one_hot = [(phase_idx == i).to(dtype=dtype).expand(batch, 1, t, h, w) for i in range(4)]
+    phase_boundary = (phase_idx == 0).to(dtype=dtype).expand(batch, 1, t, h, w)
+    return torch.cat([coords, sin_phase, cos_phase, *one_hot, phase_boundary], dim=1)
 
 
 class ResBlock3D(nn.Module):
@@ -67,16 +104,19 @@ class K5ToKVAEAdapter(nn.Module):
         self,
         *,
         latent_channels: int = 16,
-        coord_channels: int = 3,
+        coord_channels: int | None = None,
+        feature_mode: str = FEATURE_MODE_COORDS,
         hidden_channels: int = 64,
         num_blocks: int = 4,
         residual: bool = True,
     ) -> None:
         super().__init__()
+        feature_mode = resolve_feature_mode(feature_mode)
         self.latent_channels = latent_channels
-        self.coord_channels = coord_channels
+        self.feature_mode = feature_mode
+        self.coord_channels = feature_coord_channels(feature_mode) if coord_channels is None else coord_channels
         self.residual = residual
-        self.in_proj = nn.Conv3d(latent_channels + coord_channels, hidden_channels, kernel_size=3, padding=1)
+        self.in_proj = nn.Conv3d(latent_channels + self.coord_channels, hidden_channels, kernel_size=3, padding=1)
         self.blocks = nn.Sequential(*[ResBlock3D(hidden_channels) for _ in range(num_blocks)])
         self.out_norm = nn.GroupNorm(min(8, hidden_channels), hidden_channels)
         self.out_act = nn.SiLU(inplace=True)

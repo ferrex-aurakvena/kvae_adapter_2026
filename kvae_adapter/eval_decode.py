@@ -10,26 +10,36 @@ import av
 import torch
 from safetensors.torch import load_file
 
-from .adapter import K5ToKVAEAdapter, make_coord_grid
+from .adapter import FEATURE_MODE_COORDS, K5ToKVAEAdapter, make_coord_grid, resolve_feature_mode
 from .data import K5CropDataset, build_dit_samples
 from .kvae2_loader import load_kvae2_t4s8
-from .losses import temporal_delta_loss
+from .metrics import decoded_metrics_for_json
 
 
-def adapter_config_from_sidecar(path: Path, hidden_channels: int, num_blocks: int) -> tuple[int, int]:
+def adapter_config_from_sidecar(path: Path, hidden_channels: int, num_blocks: int) -> tuple[int, int, str]:
     sidecar = path.with_suffix(path.suffix + ".json")
     if not sidecar.exists():
-        return hidden_channels, num_blocks
+        return hidden_channels, num_blocks, FEATURE_MODE_COORDS
     with sidecar.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     cfg = payload.get("config", {})
-    return int(cfg.get("hidden_channels", hidden_channels)), int(cfg.get("num_blocks", num_blocks))
+    return (
+        int(cfg.get("hidden_channels", hidden_channels)),
+        int(cfg.get("num_blocks", num_blocks)),
+        resolve_feature_mode(cfg.get("feature_mode", FEATURE_MODE_COORDS)),
+    )
+
+
+def normalize_state_dict(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    if state and all(k.startswith("_orig_mod.") for k in state):
+        return {k[len("_orig_mod.") :]: v for k, v in state.items()}
+    return state
 
 
 def load_adapter(path: Path, *, device: torch.device, hidden_channels: int, num_blocks: int) -> K5ToKVAEAdapter:
-    hidden_channels, num_blocks = adapter_config_from_sidecar(path, hidden_channels, num_blocks)
-    adapter = K5ToKVAEAdapter(hidden_channels=hidden_channels, num_blocks=num_blocks)
-    adapter.load_state_dict(load_file(str(path), device="cpu"), strict=True)
+    hidden_channels, num_blocks, feature_mode = adapter_config_from_sidecar(path, hidden_channels, num_blocks)
+    adapter = K5ToKVAEAdapter(hidden_channels=hidden_channels, num_blocks=num_blocks, feature_mode=feature_mode)
+    adapter.load_state_dict(normalize_state_dict(load_file(str(path), device="cpu")), strict=True)
     adapter.to(device=device)
     adapter.eval()
     adapter.requires_grad_(False)
@@ -67,6 +77,22 @@ def psnr_m11(pred: torch.Tensor, target: torch.Tensor) -> float:
     if mse <= 0:
         return float("inf")
     return 20.0 * math.log10(2.0) - 10.0 * math.log10(mse)
+
+
+def masked_l1_m11(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    pred_m = pred[:, :, mask]
+    target_m = target[:, :, mask]
+    if pred_m.numel() == 0:
+        return float("nan")
+    return float((pred_m.float() - target_m.float()).abs().mean().item())
+
+
+def masked_psnr_m11(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
+    pred_m = pred[:, :, mask]
+    target_m = target[:, :, mask]
+    if pred_m.numel() == 0:
+        return float("nan")
+    return psnr_m11(pred_m, target_m)
 
 
 def main() -> int:
@@ -115,6 +141,7 @@ def main() -> int:
         total_w=info.total_w,
         device=device,
         dtype=dtype,
+        feature_mode=adapter.feature_mode,
     )
     with torch.no_grad(), torch.autocast(device_type="cuda" if device.type == "cuda" else "cpu", dtype=dtype, enabled=device.type == "cuda"):
         z_pred = adapter(z, coords)
@@ -122,7 +149,6 @@ def main() -> int:
     teacher_b = teacher.unsqueeze(0).to(device=pred.device, dtype=pred.dtype)
     pred = pred[:, :, : teacher_b.shape[2], : teacher_b.shape[3], : teacher_b.shape[4]]
     side_by_side = torch.cat([teacher_b, pred], dim=-1)
-
     args.out_dir.mkdir(parents=True, exist_ok=True)
     write_mp4(args.out_dir / "teacher.mp4", teacher_b.cpu(), fps=args.fps)
     write_mp4(args.out_dir / "adapter_kvae.mp4", pred.cpu(), fps=args.fps)
@@ -135,9 +161,9 @@ def main() -> int:
         "x0": info.x0,
         "crop_px": args.crop_px,
         "frames": args.frames,
-        "l1_m11": float((pred.float() - teacher_b.float()).abs().mean().item()),
-        "psnr_m11": psnr_m11(pred, teacher_b),
-        "temporal_delta_l1": float(temporal_delta_loss(pred.float(), teacher_b.float()).item()),
+        "reference_source": "legacy_hvae_decode",
+        "quality_target_note": "Use KVAE decoded-cache eval/training metrics for the real t4s8 target; this crop teacher is legacy HVAE decode.",
+        **decoded_metrics_for_json(pred, teacher_b),
     }
     with (args.out_dir / "metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, indent=2)

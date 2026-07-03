@@ -11,11 +11,17 @@ from safetensors.torch import save_file
 from torch.nn import functional as F
 from tqdm import tqdm
 
-from .adapter import K5ToKVAEAdapter
+from .adapter import FEATURE_MODE_CHOICES, FEATURE_MODE_COORDS, K5ToKVAEAdapter, resolve_feature_mode
 from .packed_cache import PackedLatentCache
 
 
-def make_coords_fast(batch: dict[str, torch.Tensor], *, dtype: torch.dtype) -> torch.Tensor:
+def make_coords_fast(
+    batch: dict[str, torch.Tensor],
+    *,
+    dtype: torch.dtype,
+    feature_mode: str = FEATURE_MODE_COORDS,
+) -> torch.Tensor:
+    feature_mode = resolve_feature_mode(feature_mode)
     z = batch["z"]
     b, _, t, h, w = z.shape
     device = z.device
@@ -28,7 +34,7 @@ def make_coords_fast(batch: dict[str, torch.Tensor], *, dtype: torch.dtype) -> t
     total_t = (batch["total_t"] - 1).clamp_min(1).to(dtype=dtype).view(b, 1, 1, 1, 1)
     total_h = (batch["total_h"] - 1).clamp_min(1).to(dtype=dtype).view(b, 1, 1, 1, 1)
     total_w = (batch["total_w"] - 1).clamp_min(1).to(dtype=dtype).view(b, 1, 1, 1, 1)
-    return torch.cat(
+    coords = torch.cat(
         [
             ((t0 + tt) / total_t).expand(b, 1, t, h, w),
             ((y0 + yy) / total_h).expand(b, 1, t, h, w),
@@ -36,6 +42,20 @@ def make_coords_fast(batch: dict[str, torch.Tensor], *, dtype: torch.dtype) -> t
         ],
         dim=1,
     ).mul_(2).sub_(1)
+    if feature_mode == FEATURE_MODE_COORDS:
+        return coords
+
+    phase_idx = (
+        batch["t0"].to(device=device, dtype=torch.long).view(b, 1, 1, 1, 1)
+        + torch.arange(t, device=device, dtype=torch.long).view(1, 1, t, 1, 1)
+    ).remainder(4)
+    phase = phase_idx.to(dtype=dtype)
+    phase_angle = phase * (2.0 * torch.pi / 4.0)
+    sin_phase = phase_angle.sin().expand(b, 1, t, h, w)
+    cos_phase = phase_angle.cos().expand(b, 1, t, h, w)
+    one_hot = [(phase_idx == i).to(dtype=dtype).expand(b, 1, t, h, w) for i in range(4)]
+    phase_boundary = (phase_idx == 0).to(dtype=dtype).expand(b, 1, t, h, w)
+    return torch.cat([coords, sin_phase, cos_phase, *one_hot, phase_boundary], dim=1)
 
 
 def per_sample_temporal(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -51,10 +71,11 @@ def loss_vec(
     *,
     amp_dtype: torch.dtype | None,
     temporal_weight: float,
+    feature_mode: str = FEATURE_MODE_COORDS,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     autocast_device = "cuda" if batch["z"].device.type == "cuda" else "cpu"
     with torch.autocast(device_type=autocast_device, dtype=amp_dtype, enabled=amp_dtype is not None):
-        coords = make_coords_fast(batch, dtype=batch["z"].dtype)
+        coords = make_coords_fast(batch, dtype=batch["z"].dtype, feature_mode=feature_mode)
         pred = adapter(batch["z"], coords)
         latent = (pred.float() - batch["target"].float()).pow(2).flatten(1).mean(dim=1)
         temporal = per_sample_temporal(pred, batch["target"])
@@ -120,6 +141,7 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--hidden-channels", type=int, default=64)
     ap.add_argument("--num-blocks", type=int, default=4)
+    ap.add_argument("--feature-mode", choices=FEATURE_MODE_CHOICES, default=FEATURE_MODE_COORDS)
     ap.add_argument("--amp", default="bf16", choices=["none", "fp16", "bf16"])
     ap.add_argument("--temporal-weight", type=float, default=0.35)
     ap.add_argument("--gpu-resident", action=argparse.BooleanOptionalAction, default=True)
@@ -145,7 +167,11 @@ def main() -> int:
     train_dtype = torch.float32 if amp_dtype is None else amp_dtype
 
     cache = PackedLatentCache.load(args.cache_dir, device=device, dtype=train_dtype, gpu_resident=args.gpu_resident)
-    adapter = K5ToKVAEAdapter(hidden_channels=args.hidden_channels, num_blocks=args.num_blocks).to(device=device)
+    adapter = K5ToKVAEAdapter(
+        hidden_channels=args.hidden_channels,
+        num_blocks=args.num_blocks,
+        feature_mode=args.feature_mode,
+    ).to(device=device)
     if args.compile:
         adapter = torch.compile(adapter)
     optim = make_optimizer(adapter.parameters(), lr=args.lr, device=device)
@@ -175,7 +201,11 @@ def main() -> int:
         batch = cache.batch(batch_indices, device=device, dtype=train_dtype)
         optim.zero_grad(set_to_none=True)
         total_vec, latent_vec, temporal_vec = loss_vec(
-            adapter, batch, amp_dtype=amp_dtype, temporal_weight=args.temporal_weight
+            adapter,
+            batch,
+            amp_dtype=amp_dtype,
+            temporal_weight=args.temporal_weight,
+            feature_mode=args.feature_mode,
         )
         loss = total_vec.mean()
         if scaler.is_enabled():
